@@ -1,0 +1,4 @@
+requests>=2.31.0
+pycardano>=0.10.0
+bip-utils>=2.9.0
+

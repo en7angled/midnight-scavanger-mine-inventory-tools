@@ -110,6 +110,99 @@ def sign_message_cip30(message: str, signing_key: PaymentSigningKey) -> str:
     return signature.hex()
 
 
+def get_terms_and_conditions() -> dict:
+    """
+    Get the Terms and Conditions message from the API.
+    
+    Returns:
+        Dictionary with 'message' and 'version' keys, or error dict
+    """
+    try:
+        response = requests.get(f"{API_BASE_URL}/TandC", timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {
+                "error": f"HTTP {response.status_code}",
+                "statusCode": response.status_code,
+                "text": response.text[:200],
+            }
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": str(e),
+            "message": f"Failed to get Terms and Conditions: {str(e)}",
+        }
+
+
+def register_address(
+    address: str,
+    signing_key: PaymentSigningKey,
+) -> dict:
+    """
+    Register an address in Scavenger Mine by accepting Terms and Conditions.
+    
+    Args:
+        address: Cardano address to register
+        signing_key: Signing key for the address
+    
+    Returns:
+        API response as dictionary
+    """
+    # Get Terms and Conditions
+    tc_data = get_terms_and_conditions()
+    if "error" in tc_data:
+        return tc_data
+    
+    tc_message = tc_data.get("message", "")
+    if not tc_message:
+        return {
+            "error": "No Terms and Conditions message received",
+            "statusCode": None,
+        }
+    
+    # Sign the Terms and Conditions message
+    signature = sign_message_cip30(tc_message, signing_key)
+    
+    # Get public key
+    verification_key = PaymentVerificationKey.from_signing_key(signing_key)
+    pubkey_hex = verification_key.payload.hex()
+    
+    # URL encode parameters
+    address_encoded = urllib.parse.quote(address, safe='')
+    signature_encoded = urllib.parse.quote(signature, safe='')
+    pubkey_encoded = urllib.parse.quote(pubkey_hex, safe='')
+    
+    # Construct the API endpoint
+    url = f"{API_BASE_URL}/register/{address_encoded}/{signature_encoded}/{pubkey_encoded}"
+    
+    # Make the API call
+    try:
+        headers = {
+            'User-Agent': 'NIGHT-Consolidation-Script/1.0'
+        }
+        response = requests.post(url, timeout=30, headers=headers)
+        
+        # Try to parse JSON response first
+        try:
+            response_data = response.json()
+            if response.status_code >= 400:
+                response_data["statusCode"] = response.status_code
+            return response_data
+        except json.JSONDecodeError:
+            # If not JSON, return text response
+            return {
+                "statusCode": response.status_code,
+                "text": response.text,
+                "error": f"HTTP {response.status_code}: {response.text[:200]}",
+            }
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": str(e),
+            "statusCode": getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None,
+            "message": f"Registration request failed: {str(e)}",
+        }
+
+
 def get_donation_message(destination_address: str) -> str:
     """
     Get the message that needs to be signed for donation/consolidation.
@@ -149,15 +242,23 @@ def donate_to(
     signature_destination = sign_message_cip30(message, destination_signing_key)
     
     # URL encode the addresses and signatures for the API endpoint
+    # Cardano addresses use base58 which is URL-safe, but encode to be safe
+    # Signatures are hex (0-9, a-f) which are URL-safe, but encode to be safe
     original_encoded = urllib.parse.quote(original_address, safe='')
     destination_encoded = urllib.parse.quote(destination_address, safe='')
+    signature_original_encoded = urllib.parse.quote(signature_original, safe='')
+    signature_destination_encoded = urllib.parse.quote(signature_destination, safe='')
     
     # Construct the API endpoint
-    url = f"{API_BASE_URL}/donate_to/{original_encoded}/{destination_encoded}/{signature_original}/{signature_destination}"
+    url = f"{API_BASE_URL}/donate_to/{original_encoded}/{destination_encoded}/{signature_original_encoded}/{signature_destination_encoded}"
     
     # Make the API call
     try:
-        response = requests.post(url, timeout=30)
+        # Minimal headers - some APIs reject custom headers
+        headers = {
+            'User-Agent': 'NIGHT-Consolidation-Script/1.0'
+        }
+        response = requests.post(url, timeout=30, headers=headers)
         
         # Try to parse JSON response first
         try:
@@ -266,6 +367,25 @@ def consolidate_addresses(
     # Determine network for derivation
     network = Network.MAINNET if network_str == "mainnet" else Network.TESTNET
     
+    # Register destination address first (if not already registered)
+    print("Ensuring destination address is registered...")
+    print(f"  Address: {destination_address[:50]}...")
+    dest_reg_result = register_address(destination_address, destination_signing_key)
+    if "error" in dest_reg_result or dest_reg_result.get("statusCode", 200) >= 400:
+        status_code = dest_reg_result.get("statusCode", "Unknown")
+        error_msg = dest_reg_result.get("error", dest_reg_result.get("message", "Unknown error"))
+        if status_code == 409:
+            print(f"  ℹ️  Destination already registered")
+        elif status_code == 400:
+            # 400 might mean already registered or invalid format
+            print(f"  ℹ️  Registration returned 400 (may already be registered)")
+        else:
+            print(f"  ⚠️  Registration warning (Status {status_code}): {error_msg}")
+            print(f"  Continuing anyway...")
+    else:
+        print(f"  ✅ Destination address registered successfully")
+    print()
+    
     # Consolidate each address
     successful = 0
     failed = 0
@@ -308,7 +428,30 @@ def consolidate_addresses(
         print(f"Consolidating from {display_name}...")
         print(f"  Address: {address[:50]}...")
         
+        # Register source address first (if not already registered)
+        print(f"  Ensuring address is registered...")
+        reg_result = register_address(address, signing_key)
+        if "error" in reg_result or reg_result.get("statusCode", 200) >= 400:
+            status_code = reg_result.get("statusCode", "Unknown")
+            error_msg = reg_result.get("error", reg_result.get("message", "Unknown error"))
+            if status_code == 409:
+                print(f"  ℹ️  Address already registered")
+            elif status_code == 400:
+                # 400 might mean already registered or invalid format - continue anyway
+                print(f"  ℹ️  Registration returned 400 (may already be registered)")
+            else:
+                print(f"  ⚠️  Registration warning (Status {status_code}): {error_msg}")
+                print(f"  Continuing anyway...")
+        else:
+            print(f"  ✅ Address registered")
+        
         try:
+            # Verify signature format before sending
+            message = get_donation_message(destination_address)
+            test_sig = sign_message_cip30(message, signing_key)
+            if len(test_sig) != 128:
+                print(f"  ⚠️  Warning: Signature length is {len(test_sig)}, expected 128")
+            
             result = donate_to(
                 address,
                 destination_address,
@@ -321,14 +464,25 @@ def consolidate_addresses(
                 error_message = result.get("message", result.get("error", "Unknown error"))
                 
                 if status_code == 404:
-                    print(f"  ⚠️  Address not registered (skipping)")
+                    print(f"  ⚠️  Address not registered or has no rewards (skipping)")
                     skipped += 1
                 elif status_code == 409:
                     print(f"  ⚠️  {error_message}")
                     skipped += 1
+                elif status_code == 403:
+                    print(f"  ❌ Error (Status 403 Forbidden): {error_message}")
+                    print(f"  ℹ️  According to the API documentation, 403 is not a standard error response.")
+                    print(f"     This suggests:")
+                    print(f"     - The original address must have submitted solutions (not just registered)")
+                    print(f"     - Server-side authorization/validation is failing")
+                    print(f"     - The address may need to have actually participated in mining")
+                    print(f"  💡 Note: Registration alone is not sufficient - addresses must have")
+                    print(f"     submitted solutions to challenges to be eligible for consolidation.")
+                    print(f"  📄 Reference: Scavenger Mine API V2 PDF - /donate_to endpoint")
+                    failed += 1
                 else:
                     print(f"  ❌ Error (Status {status_code}): {error_message}")
-                    if "status_code" in result:
+                    if "status_code" in result or "text" in result:
                         print(f"  Full response: {result}")
                     failed += 1
             else:
