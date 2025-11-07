@@ -234,7 +234,7 @@ Examples:
     parser.add_argument(
         "--max-index",
         type=int,
-        default=50,
+        default=200,
         help="Maximum address index to generate per account (default: 30)",
     )
     
