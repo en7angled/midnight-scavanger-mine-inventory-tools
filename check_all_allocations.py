@@ -197,12 +197,13 @@ def check_all_allocations(json_paths: List[str], output_file: str = "allocations
         
         # Check if we should skip this address based on previous unregistered addresses
         # We track per account AND type, since staked and non-staked have separate index sequences
-        if account is not None and addr_type:
+        # IMPORTANT: We don't skip indices 0-50, we always check those
+        if account is not None and addr_type and index > 50:
             account_type_key = (account, addr_type)
             last_checked = last_checked_index_per_account_type.get(account_type_key)
             if last_checked is not None and index > last_checked:
                 # We found an unregistered address at a lower index for this account/type combination
-                # Skip all higher indices for this account/type
+                # Skip all higher indices for this account/type (but only for indices > 50)
                 skipped_addresses += 1
                 results.append({
                     "address": address,
@@ -246,12 +247,13 @@ def check_all_allocations(json_paths: List[str], output_file: str = "allocations
                     "error": "Not registered",
                 })
                 # Mark this index as the last checked for this account/type combination
-                # All higher indices for this account/type will be skipped
-                if account is not None and addr_type:
+                # All higher indices for this account/type will be skipped (but only for indices > 50)
+                # We always check indices 0-50 regardless of registration status
+                if account is not None and addr_type and index > 50:
                     account_type_key = (account, addr_type)
                     if account_type_key not in last_checked_index_per_account_type or last_checked_index_per_account_type[account_type_key] < index:
                         last_checked_index_per_account_type[account_type_key] = index
-                        print(f"    ℹ️  Skipping remaining {addr_type} indices > {index} in account {account}")
+                        print(f"    ℹ️  Skipping remaining {addr_type} indices > {index} in account {account} (indices 0-50 are always checked)")
             elif status_code == 429:
                 print(f"    ❌ Rate limited - stopping to avoid further rate limits")
                 print(f"    💡 Wait a few minutes and run again, or reduce delay_between_requests")
