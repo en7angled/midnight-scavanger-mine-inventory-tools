@@ -17,12 +17,8 @@ The toolkit consists of four main scripts:
 - ✅ Supports both staked (`addr1q`) and non-staked (`addr1v`) addresses
 - ✅ Check NIGHT allocations and solutions for addresses
 - ✅ Generate comprehensive allocation reports (JSON format)
-- ✅ Consolidate rewards from multiple accounts/addresses into one
 - ✅ Generate donation URLs for manual consolidation
 - ✅ Handles CIP-30 signatures required by the API
-- ✅ Supports both testnet and mainnet
-- ✅ Smart optimization: skips higher indices when unregistered addresses are found (indices 0-50 always checked)
-- ✅ Provides clear progress feedback and error handling
 
 ## Installation
 
