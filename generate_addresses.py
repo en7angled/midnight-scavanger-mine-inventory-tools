@@ -8,6 +8,8 @@ The generated JSON can be used with consolidate_night.py to consolidate NIGHT to
 
 import argparse
 import json
+import copy
+from typing import Optional, Tuple
 from pycardano import (
     Address,
     Network,
@@ -20,7 +22,7 @@ from pycardano import (
 )
 
 
-def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, network: Network = Network.TESTNET, use_cip1852: bool = True) -> tuple[str, PaymentSigningKey]:
+def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, network: Network = Network.TESTNET, use_cip1852: bool = True, staked: bool = True) -> Tuple[str, PaymentSigningKey]:
     """
     Derive a Cardano address from a mnemonic phrase.
     
@@ -34,6 +36,7 @@ def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, ne
         index: Address index within the account (default: 0)
         network: Cardano network (TESTNET or MAINNET)
         use_cip1852: If True, use CIP-1852 (default), if False, use BIP44
+        staked: If True, generate base address (addr1q) with stake, if False, generate enterprise address (addr1v) without stake
     
     Returns:
         Tuple of (address_string, signing_key)
@@ -43,18 +46,19 @@ def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, ne
     
     if use_cip1852:
         # CIP-1852 derivation path: m/1852'/1815'/account'/0/index (payment)
-        #                         m/1852'/1815'/account'/2/0 (stake)
         payment_path = f"m/1852'/1815'/{account}'/0/{index}"
-        stake_path = f"m/1852'/1815'/{account}'/2/0"
+        if staked:
+            # For staked addresses, we need stake path: m/1852'/1815'/account'/2/0
+            stake_path = f"m/1852'/1815'/{account}'/2/0"
     else:
         # BIP44 derivation path: m/44'/1815'/account'/0/index (payment)
-        # For BIP44, we still need stake for base address, use same account
         payment_path = f"m/44'/1815'/{account}'/0/{index}"
-        stake_path = f"m/44'/1815'/{account}'/2/0"
+        if staked:
+            # For staked addresses, we need stake path: m/44'/1815'/account'/2/0
+            stake_path = f"m/44'/1815'/{account}'/2/0"
     
-    # Derive payment and stake wallets
+    # Derive payment wallet
     payment_wallet = wallet.derive_from_path(payment_path, private=True)
-    stake_wallet = wallet.derive_from_path(stake_path, private=True)
     
     # Extract private key for signing (xprivate_key is 64 bytes: chain code + private key)
     # Take the last 32 bytes which is the actual private key
@@ -66,14 +70,24 @@ def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, ne
     # Create address hashes directly from public keys (Cardano uses blake2b-224)
     from hashlib import blake2b
     payment_hash = VerificationKeyHash(blake2b(payment_wallet.public_key, digest_size=28).digest())
-    stake_hash = VerificationKeyHash(blake2b(stake_wallet.public_key, digest_size=28).digest())
     
-    # Create base address with both payment and stake parts
-    address = Address(
-        payment_part=payment_hash,
-        staking_part=stake_hash,
-        network=network,
-    )
+    if staked:
+        # Derive stake wallet for base address (addr1q)
+        stake_wallet = wallet.derive_from_path(stake_path, private=True)
+        stake_hash = VerificationKeyHash(blake2b(stake_wallet.public_key, digest_size=28).digest())
+        
+        # Create base address with both payment and stake parts
+        address = Address(
+            payment_part=payment_hash,
+            staking_part=stake_hash,
+            network=network,
+        )
+    else:
+        # Create enterprise address (addr1v) without stake part
+        address = Address(
+            payment_part=payment_hash,
+            network=network,
+        )
     
     return str(address), payment_signing_key
 
@@ -86,9 +100,10 @@ def generate_address_list(
     destination_account: int = 0,
     destination_index: int = 0,
     use_cip1852: bool = True,
-) -> dict:
+    include_enterprise: bool = False,
+) -> Tuple[dict, Optional[dict]]:
     """
-    Generate a JSON-compatible dictionary of addresses.
+    Generate JSON-compatible dictionaries of addresses.
     
     Args:
         mnemonic: BIP39 mnemonic phrase
@@ -97,48 +112,74 @@ def generate_address_list(
         network: Cardano network
         destination_account: Account number for destination address
         destination_index: Index for destination address
+        use_cip1852: Use CIP-1852 derivation (default) or BIP44
+        include_enterprise: If True, generate both staked (addr1q) and non-staked (addr1v) addresses
     
     Returns:
-        Dictionary with addresses and metadata
+        Tuple of (staked_dict, non_staked_dict). If include_enterprise is False, non_staked_dict is None.
     """
     network_str = "mainnet" if network == Network.MAINNET else "testnet"
     
-    result = {
+    # Derive destination address (always staked/base address)
+    dest_address, _ = derive_address_from_mnemonic(
+        mnemonic, destination_account, destination_index, network, use_cip1852, staked=True
+    )
+    
+    # Base structure for both address types
+    base_structure = {
         "network": network_str,
-        "use_cip1852": use_cip1852,  # Store derivation method in JSON
+        "use_cip1852": use_cip1852,
         "destination": {
             "account": destination_account,
             "index": destination_index,
+            "address": dest_address,
+            "type": "staked",
         },
         "source_addresses": [],
     }
     
-    # Derive destination address
-    dest_address, _ = derive_address_from_mnemonic(
-        mnemonic, destination_account, destination_index, network, use_cip1852
-    )
-    result["destination"]["address"] = dest_address
+    # Use deep copy to ensure nested structures are independent
+    staked_result = copy.deepcopy(base_structure)
+    non_staked_result = copy.deepcopy(base_structure) if include_enterprise else None
     
     # Derive source addresses
     for account in accounts:
         for index in range(max_index + 1):
             try:
-                address, _ = derive_address_from_mnemonic(
-                    mnemonic, account, index, network, use_cip1852
+                # Generate staked address (base address, addr1q)
+                staked_address, _ = derive_address_from_mnemonic(
+                    mnemonic, account, index, network, use_cip1852, staked=True
                 )
                 
                 # Skip if same as destination
-                if address != dest_address:
-                    result["source_addresses"].append({
-                        "address": address,
+                if staked_address != dest_address:
+                    staked_result["source_addresses"].append({
+                        "address": staked_address,
                         "account": account,
                         "index": index,
+                        "type": "staked",
                     })
+                
+                # If requested, also generate enterprise address (non-staked, addr1v)
+                if include_enterprise:
+                    enterprise_address, _ = derive_address_from_mnemonic(
+                        mnemonic, account, index, network, use_cip1852, staked=False
+                    )
+                    
+                    # Skip if same as destination
+                    if enterprise_address != dest_address:
+                        non_staked_result["source_addresses"].append({
+                            "address": enterprise_address,
+                            "account": account,
+                            "index": index,
+                            "type": "non-staked",
+                        })
+                        
             except Exception as e:
                 print(f"Warning: Could not derive address for account {account}, index {index}: {e}")
                 continue
     
-    return result
+    return staked_result, non_staked_result
 
 
 def main():
@@ -155,6 +196,9 @@ Examples:
   
   # Use mainnet and check more indices
   python generate_addresses.py --mnemonic "word1 word2 ... word24" --accounts 0 1 2 --mainnet --max-index 20 -o addresses.json
+  
+  # Generate both staked and non-staked addresses
+  python generate_addresses.py --mnemonic "word1 word2 ... word24" --accounts 0 1 2 --include-enterprise -o addresses.json
         """
     )
     
@@ -207,6 +251,12 @@ Examples:
     )
     
     parser.add_argument(
+        "--include-enterprise",
+        action="store_true",
+        help="Also generate non-staked enterprise addresses (addr1v) in addition to staked addresses (addr1q)",
+    )
+    
+    parser.add_argument(
         "-o", "--output",
         type=str,
         default="addresses.json",
@@ -234,9 +284,10 @@ Examples:
         print(f"Derivation: {'CIP-1852' if use_cip1852 else 'BIP44'} (m/{'1852' if use_cip1852 else '44'}'/1815'/account'/0/index)")
         print(f"Accounts: {args.accounts}")
         print(f"Destination: account {args.destination_account}, index {args.destination_index}")
-        print(f"Max index per account: {args.max_index}\n")
+        print(f"Max index per account: {args.max_index}")
+        print(f"Include enterprise addresses: {args.include_enterprise}\n")
         
-        address_data = generate_address_list(
+        staked_data, non_staked_data = generate_address_list(
             mnemonic=mnemonic,
             accounts=args.accounts,
             max_index=args.max_index,
@@ -244,17 +295,43 @@ Examples:
             destination_account=args.destination_account,
             destination_index=args.destination_index,
             use_cip1852=use_cip1852,
+            include_enterprise=args.include_enterprise,
         )
         
-        # Write to file
-        with open(args.output, 'w') as f:
-            json.dump(address_data, f, indent=2)
+        # Determine output filenames
+        if args.include_enterprise:
+            # Split filename into base and extension
+            if '.' in args.output:
+                base_name, ext = args.output.rsplit('.', 1)
+                staked_output = f"{base_name}_staked.{ext}"
+                non_staked_output = f"{base_name}_enterprise.{ext}"
+            else:
+                staked_output = f"{args.output}_staked"
+                non_staked_output = f"{args.output}_enterprise"
+        else:
+            staked_output = args.output
+            non_staked_output = None
         
-        print(f"✅ Generated {len(address_data['source_addresses'])} source addresses")
-        print(f"✅ Destination address: {address_data['destination']['address']}")
-        print(f"✅ Saved to: {args.output}")
-        print(f"\nYou can now use this file with consolidate_night.py:")
-        print(f"  python consolidate_night.py --addresses {args.output} --mnemonic \"{args.mnemonic}\"")
+        # Write staked addresses to file
+        with open(staked_output, 'w') as f:
+            json.dump(staked_data, f, indent=2)
+        
+        print(f"✅ Generated {len(staked_data['source_addresses'])} staked addresses (addr1q)")
+        print(f"✅ Destination address: {staked_data['destination']['address']} (staked)")
+        print(f"✅ Saved staked addresses to: {staked_output}")
+        
+        # Write non-staked addresses to separate file if requested
+        if args.include_enterprise and non_staked_data:
+            with open(non_staked_output, 'w') as f:
+                json.dump(non_staked_data, f, indent=2)
+            
+            print(f"✅ Generated {len(non_staked_data['source_addresses'])} non-staked addresses (addr1v)")
+            print(f"✅ Saved non-staked addresses to: {non_staked_output}")
+        
+        print(f"\nYou can now use these files with consolidate_night.py:")
+        print(f"  python consolidate_night.py --addresses {staked_output} --mnemonic \"{args.mnemonic}\"")
+        if args.include_enterprise:
+            print(f"  python consolidate_night.py --addresses {non_staked_output} --mnemonic \"{args.mnemonic}\"")
         
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
