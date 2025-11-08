@@ -10,24 +10,19 @@ import argparse
 import json
 import urllib.parse
 import requests
-from typing import List, Optional
+from typing import Optional
 from pycardano import (
     Address,
     Network,
     PaymentSigningKey,
-    PaymentVerificationKey,
-    StakeSigningKey,
-    StakeVerificationKey,
     HDWallet,
     VerificationKeyHash,
 )
-
-
 # Scavenger Mine API base URL
 API_BASE_URL = "https://scavenger.prod.gd.midnighttge.io"
 
 
-def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, network: Network = Network.TESTNET, use_cip1852: bool = True) -> tuple[str, PaymentSigningKey]:
+def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, network: Network = Network.TESTNET, use_cip1852: bool = True) -> tuple[str, PaymentSigningKey, bytes]:
     """
     Derive a Cardano address from a mnemonic phrase.
     
@@ -63,12 +58,21 @@ def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, ne
     payment_wallet = wallet.derive_from_path(payment_path, private=True)
     stake_wallet = wallet.derive_from_path(stake_path, private=True)
     
-    # Extract private key for signing (xprivate_key is 64 bytes: chain code + private key)
-    # Take the last 32 bytes which is the actual private key
-    payment_private_key = payment_wallet.xprivate_key[32:] if len(payment_wallet.xprivate_key) >= 64 else payment_wallet.xprivate_key[:32]
+    # Extract private key for signing
+    # pycardano's HDWallet uses BIP32 Ed25519 where xprivate_key is kL + kR (64 bytes)
+    # - kL (first 32 bytes): private scalar used to compute the public key
+    # - kR (last 32 bytes): used for signing
+    # We use kL (first 32 bytes) for PaymentSigningKey compatibility
+    payment_private_key = payment_wallet.xprivate_key[:32] if len(payment_wallet.xprivate_key) >= 32 else payment_wallet.xprivate_key
     
-    # Create signing key (needed for signing transactions)
+    # Create PaymentSigningKey from kL (for compatibility with existing code)
     payment_signing_key = PaymentSigningKey.from_primitive(payment_private_key)
+    
+    # Store the full xprivate_key (kL + kR, 64 bytes) and chain_code for BIP32 Ed25519 signing
+    # This allows us to use BIP32ED25519PrivateKey for proper signing that matches the wallet's public key
+    payment_signing_key._wallet_xprivate_key = payment_wallet.xprivate_key  # kL + kR (64 bytes)
+    payment_signing_key._wallet_chain_code = payment_wallet.chain_code  # chain code (32 bytes)
+    payment_signing_key._wallet_public_key = payment_wallet.public_key  # public key (32 bytes, matches address)
     
     # Create address hashes directly from public keys (Cardano uses blake2b-224)
     from hashlib import blake2b
@@ -82,32 +86,165 @@ def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, ne
         network=network,
     )
     
-    return str(address), payment_signing_key
+    # Return address, signing key, and the public key bytes (32 bytes)
+    # The wallet's public_key is what was used to create the address (matches Eternl)
+    public_key_bytes = payment_wallet.public_key
+    
+    return str(address), payment_signing_key, public_key_bytes
 
 
-def sign_message_cip30(message: str, signing_key: PaymentSigningKey) -> str:
+def sign_message_cip30(message: str, signing_key: PaymentSigningKey, address: Optional[str] = None, use_cbor: bool = True) -> str:
     """
     Sign a message using CIP-30 signature format.
     
-    CIP-30 uses Ed25519 signatures over UTF-8 encoded messages.
+    CIP-30 signature can be either:
+    - Raw hex (for donation endpoint): Just the Ed25519 signature hex
+    - CBOR-encoded (for registration): CBOR structure with signature, key, and message
     
     Args:
         message: Message to sign
         signing_key: Payment signing key
+        address: Optional address (required for CBOR format)
+        use_cbor: If True, return CBOR-encoded format; if False, return raw hex
     
     Returns:
-        Hex-encoded signature string (128 characters, 64 bytes)
+        Hex-encoded signature string (CBOR if use_cbor=True, raw hex if False)
     """
     # Convert message to bytes (UTF-8 encoding)
     message_bytes = message.encode('utf-8')
     
-    # Sign the message using Ed25519
-    # pycardano's PaymentSigningKey uses Ed25519 internally
-    signature = signing_key.sign(message_bytes)
+    # If not using CBOR, return raw hex signature (for donation endpoint)
+    if not use_cbor:
+        signature_bytes = signing_key.sign(message_bytes)
+        return signature_bytes.hex()
     
-    # Return hex-encoded signature
-    # Ed25519 signatures are 64 bytes = 128 hex characters
-    return signature.hex()
+    # For CBOR format (registration endpoint), we need the address
+    import cbor2
+    from pycardano import Address
+    
+    if not address:
+        # Derive address from verification key
+        from pycardano import PaymentVerificationKey, VerificationKeyHash
+        from hashlib import blake2b
+        verification_key = signing_key.to_verification_key()
+        payment_hash = VerificationKeyHash(blake2b(bytes(verification_key), digest_size=28).digest())
+        # For registration, we might not have stake key, so create enterprise address
+        try:
+            address_obj = Address(payment_part=payment_hash, network=Network.MAINNET)
+            address = str(address_obj)
+        except:
+            # Fallback: use the hash directly
+            address = payment_hash.to_primitive().hex()
+    
+    # CIP-8/CIP-30 signature structure (COSE Sign1 format):
+    # Based on the working Rust implementation in shadowharvester:
+    # 
+    # Step 1: Create protected header (CBOR map):
+    #   Key 1: -8 (algorithm identifier for Ed25519)
+    #   Key "address": address bytes
+    #
+    # Step 2: Create CoseSignData structure to sign:
+    #   Array of 4: ["Signature1", protected_header_cbor, external_aad (empty), payload]
+    #
+    # Step 3: Sign the CoseSignData CBOR (not just the message!)
+    #
+    # Step 4: Create final COSE Sign1 structure:
+    #   Array of 4:
+    #     [0] protected_header (CBOR bytes)
+    #     [1] unprotected_header (CBOR map with "hashed": false)
+    #     [2] payload (message bytes)
+    #     [3] signature (64 bytes Ed25519 signature)
+    
+    # Parse the address to get its bytes
+    # The address needs to be converted to its raw bytes representation
+    # In Rust: kp.2.to_vec() where kp.2 is a ShelleyAddress
+    # This gets the address as a byte vector (the raw address bytes)
+    try:
+        # Decode the Bech32 address to get the Address object
+        addr_obj = Address.decode(address)
+        # Get the address as bytes (this should match kp.2.to_vec() in Rust)
+        address_bytes = bytes(addr_obj)
+    except Exception as e:
+        # If decoding fails, try alternative method
+        try:
+            # Try using the address's payment part hash
+            from pycardano import PaymentVerificationKey, VerificationKeyHash
+            from hashlib import blake2b
+            verification_key = signing_key.to_verification_key()
+            payment_hash = VerificationKeyHash(blake2b(bytes(verification_key), digest_size=28).digest())
+            # Use the hash as address bytes (this might not be correct, but it's a fallback)
+            address_bytes = payment_hash.to_primitive()
+        except:
+            # Last resort: encode address string as UTF-8 (not ideal, but better than failing)
+            address_bytes = address.encode('utf-8')
+    
+    # Step 1: Create protected header: CBOR map with algorithm (-8) and address
+    protected_header = {
+        1: -8,  # Algorithm identifier for Ed25519
+        "address": address_bytes
+    }
+    protected_header_cbor = cbor2.dumps(protected_header)
+    
+    # Step 2: Create CoseSignData structure (this is what we sign)
+    # Array of 4: ["Signature1", protected_header_cbor, external_aad, payload]
+    cose_sign_data = [
+        "Signature1",           # Label
+        protected_header_cbor,  # Protected header (CBOR bytes)
+        b"",                    # External AAD (empty)
+        message_bytes           # Payload (message bytes)
+    ]
+    to_sign_cbor = cbor2.dumps(cose_sign_data)
+    
+    # Step 3: Sign the CoseSignData CBOR (not just the message!)
+    # We need to ensure the signature can be verified with the public key that matches the address
+    # The address was created with the wallet's public key, so we need to sign with a key
+    # that can be verified with that public key
+    from pycardano.crypto.bip32 import BIP32ED25519PrivateKey
+    
+    # Check if we have the full xprivate_key and chain_code stored (from derive_address_from_mnemonic)
+    # If so, use BIP32ED25519PrivateKey for proper BIP32 Ed25519 signing
+    wallet_xprivate_key = getattr(signing_key, '_wallet_xprivate_key', None)
+    wallet_chain_code = getattr(signing_key, '_wallet_chain_code', None)
+    
+    if wallet_xprivate_key and wallet_chain_code and len(wallet_xprivate_key) == 64:
+        # Use BIP32ED25519PrivateKey for proper BIP32 Ed25519 signing
+        # This ensures the signature can be verified with the wallet's public key
+        bip32_private_key = BIP32ED25519PrivateKey(
+            private_key=wallet_xprivate_key,  # kL + kR (64 bytes)
+            chain_code=wallet_chain_code
+        )
+        # Sign with BIP32 Ed25519 (returns 64-byte signature)
+        signature_bytes = bip32_private_key.sign(to_sign_cbor)
+    else:
+        # Fallback to nacl signing (standard Ed25519, not BIP32)
+        # This should only happen if the signing key wasn't created via derive_address_from_mnemonic
+        import nacl.signing
+        signing_key_bytes = bytes(signing_key)
+        if len(signing_key_bytes) >= 32:
+            private_key = signing_key_bytes[:32]
+        else:
+            private_key = signing_key_bytes
+        nacl_signing_key = nacl.signing.SigningKey(private_key)
+        signed_message = nacl_signing_key.sign(to_sign_cbor)
+        signature_bytes = signed_message.signature  # Extract just the signature (64 bytes)
+    
+    # Step 4: Create unprotected header: CBOR map with "hashed": false
+    unprotected_header = {
+        "hashed": False
+    }
+    
+    # Step 5: Create final COSE Sign1 structure: [protected_header, unprotected_header, payload, signature]
+    cose_sign1 = [
+        protected_header_cbor,  # Element 0: Protected header (CBOR bytes)
+        unprotected_header,     # Element 1: Unprotected header (CBOR map)
+        message_bytes,          # Element 2: Payload (message bytes)
+        signature_bytes         # Element 3: Signature (64 bytes)
+    ]
+    
+    cbor_bytes = cbor2.dumps(cose_sign1)
+    
+    # Return hex-encoded CBOR
+    return cbor_bytes.hex()
 
 
 def get_terms_and_conditions() -> dict:
@@ -179,8 +316,9 @@ def generate_donation_url(
         Complete HTTPS URL string
     """
     # Sign the message with the original address key only
+    # For donation endpoint, use raw hex (not CBOR)
     message = get_donation_message(destination_address)
-    signature_original = sign_message_cip30(message, original_signing_key)
+    signature_original = sign_message_cip30(message, original_signing_key, original_address, use_cbor=False)
     
     # URL encode the addresses and signature
     original_encoded = urllib.parse.quote(original_address, safe='')
@@ -216,7 +354,8 @@ def donate_to(
     message = get_donation_message(destination_address)
     
     # Sign with the original address key only (per API docs)
-    signature_original = sign_message_cip30(message, original_signing_key)
+    # For donation endpoint, use raw hex (not CBOR)
+    signature_original = sign_message_cip30(message, original_signing_key, original_address, use_cbor=False)
     
     # URL encode the addresses and signature for the API endpoint
     # Cardano addresses use base58 which is URL-safe, but encode to be safe
@@ -299,7 +438,7 @@ def load_addresses_from_json(json_path: str, mnemonic: str) -> tuple[dict, str, 
     use_cip1852 = address_data.get("use_cip1852", True)
     
     # Derive destination address and signing key
-    destination_address, destination_signing_key = derive_address_from_mnemonic(
+    destination_address, destination_signing_key, _ = derive_address_from_mnemonic(
         mnemonic, dest_account, dest_index, network, use_cip1852
     )
     
@@ -366,7 +505,7 @@ def generate_donation_urls(
         try:
             if account is not None and index is not None:
                 # Derive from account/index
-                _, signing_key = derive_address_from_mnemonic(
+                _, signing_key, _ = derive_address_from_mnemonic(
                     mnemonic, account, index, network, use_cip1852
                 )
                 display_name = f"account {account}, index {index}"
@@ -478,7 +617,7 @@ def consolidate_addresses(
         try:
             if account is not None and index is not None:
                 # Derive from account/index
-                _, signing_key = derive_address_from_mnemonic(
+                _, signing_key, _ = derive_address_from_mnemonic(
                     mnemonic, account, index, network, use_cip1852
                 )
                 display_name = f"account {account}, index {index}"

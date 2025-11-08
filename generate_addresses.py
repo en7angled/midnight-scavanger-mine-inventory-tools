@@ -20,15 +20,16 @@ from pycardano import (
     HDWallet,
     VerificationKeyHash,
 )
+# Note: We use pycardano's HDWallet for address generation (matches Eternl wallet)
+# The signing key extraction is handled separately in consolidate_night.py
 
 
 def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, network: Network = Network.TESTNET, use_cip1852: bool = True, staked: bool = True) -> Tuple[str, PaymentSigningKey]:
     """
     Derive a Cardano address from a mnemonic phrase.
     
-    Supports both CIP-1852 (modern wallets) and BIP44 (legacy).
-    - CIP-1852: m/1852'/1815'/account'/0/index (default, used by Eternl, Daedalus, Yoroi)
-    - BIP44: m/44'/1815'/account'/0/index (legacy)
+    Uses pycardano's HDWallet which matches Eternl wallet derivation.
+    This is the correct method for generating addresses that match wallet software.
     
     Args:
         mnemonic: BIP39 mnemonic phrase
@@ -41,7 +42,7 @@ def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, ne
     Returns:
         Tuple of (address_string, signing_key)
     """
-    # Use pycardano's HDWallet which properly handles CIP-1852
+    # Use pycardano's HDWallet (matches Eternl wallet)
     wallet = HDWallet.from_mnemonic(mnemonic)
     
     if use_cip1852:
