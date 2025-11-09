@@ -108,7 +108,7 @@ def get_address_statistics(address: str, max_retries: int = 3, retry_delay: floa
     }
 
 
-def check_all_allocations(json_paths: List[str], output_file: str = "allocations_report.json", delay_between_requests: float = 1.0) -> None:
+def check_all_allocations(json_paths: List[str], output_file: str = "allocations_report.json", delay_between_requests: float = 1.0, no_skip: bool = False) -> None:
     """
     Check NIGHT allocations for all source addresses in the JSON files.
     
@@ -116,11 +116,16 @@ def check_all_allocations(json_paths: List[str], output_file: str = "allocations
         json_paths: List of paths to JSON files containing address lists
         output_file: Path to output file for the report
         delay_between_requests: Delay in seconds between API requests (default: 1.0)
+        no_skip: If True, check all addresses without skipping (default: False)
     """
     print(f"Loading addresses from {len(json_paths)} file(s):")
     for path in json_paths:
         print(f"  - {path}")
     print()
+    
+    if no_skip:
+        print("⚠️  Skipping optimization is DISABLED - all addresses will be checked")
+        print()
     
     # Load all addresses from all files
     all_source_addresses: List[Dict] = []
@@ -176,11 +181,12 @@ def check_all_allocations(json_paths: List[str], output_file: str = "allocations
     registered_count = 0
     error_count = 0
     
-    # Track the last checked index per account AND type
+    # Track the skip threshold per account AND type
     # If we find an unregistered address at index N for account X, type Y,
-    # we can skip all indices > N for account X, type Y
-    # Key format: (account, type) -> last_checked_index
-    last_checked_index_per_account_type: Dict[tuple[int, str], int] = {}
+    # we can skip all indices from N+1 up to (but not including) the next multiple of 50
+    # We always check indices that are multiples of 50 (0, 50, 100, 150, etc.)
+    # Key format: (account, type) -> skip_threshold (next multiple of 50)
+    skip_threshold_per_account_type: Dict[tuple[int, str], int] = {}
     skipped_addresses = 0
     
     # Check each address
@@ -197,13 +203,20 @@ def check_all_allocations(json_paths: List[str], output_file: str = "allocations
         
         # Check if we should skip this address based on previous unregistered addresses
         # We track per account AND type, since staked and non-staked have separate index sequences
-        # IMPORTANT: We don't skip indices 0-50, we always check those
-        if account is not None and addr_type and index > 50:
+        # If we found an unregistered address at index N, we skip up to the next multiple of 50
+        # We always check indices 0, 1, and all multiples of 50 (0, 50, 100, 150, etc.)
+        # Skip logic can be disabled with the no_skip flag
+        if not no_skip and account is not None and addr_type:
             account_type_key = (account, addr_type)
-            last_checked = last_checked_index_per_account_type.get(account_type_key)
-            if last_checked is not None and index > last_checked:
-                # We found an unregistered address at a lower index for this account/type combination
-                # Skip all higher indices for this account/type (but only for indices > 50)
+            skip_threshold = skip_threshold_per_account_type.get(account_type_key)
+            
+            # Check if we should skip this index
+            # Skip if: there's a threshold AND current index is less than threshold AND 
+            #          not a multiple of 50 AND not index 0 or 1 (always check 0 and 1)
+            is_multiple_of_50 = (index % 50 == 0)
+            is_always_check = (index == 0 or index == 1)
+            if skip_threshold is not None and index < skip_threshold and not is_multiple_of_50 and not is_always_check:
+                # Skip this index (we found an unregistered address earlier, skip until next multiple of 50)
                 skipped_addresses += 1
                 results.append({
                     "address": address,
@@ -215,7 +228,7 @@ def check_all_allocations(json_paths: List[str], output_file: str = "allocations
                     "crypto_receipts": 0,
                     "night_allocation_star": 0,
                     "night_allocation_night": 0.0,
-                    "error": f"Skipped (lower {addr_type} index not registered)",
+                    "error": f"Skipped (unregistered address found earlier, skipping to next multiple of 50)",
                     "skipped": True,
                 })
                 continue
@@ -246,14 +259,20 @@ def check_all_allocations(json_paths: List[str], output_file: str = "allocations
                     "night_allocation_night": 0.0,
                     "error": "Not registered",
                 })
-                # Mark this index as the last checked for this account/type combination
-                # All higher indices for this account/type will be skipped (but only for indices > 50)
-                # We always check indices 0-50 regardless of registration status
-                if account is not None and addr_type and index > 50:
+                # Calculate the next multiple of 50 after this unregistered index
+                # If we found unregistered at index N, we can skip up to (but not including) the next multiple of 50
+                # Example: index 7 -> skip to 50, index 78 -> skip to 100
+                # Only update skip threshold if skipping is enabled
+                if not no_skip and account is not None and addr_type:
                     account_type_key = (account, addr_type)
-                    if account_type_key not in last_checked_index_per_account_type or last_checked_index_per_account_type[account_type_key] < index:
-                        last_checked_index_per_account_type[account_type_key] = index
-                        print(f"    ℹ️  Skipping remaining {addr_type} indices > {index} in account {account} (indices 0-50 are always checked)")
+                    # Calculate next multiple of 50: ((index // 50) + 1) * 50
+                    next_multiple_of_50 = ((index // 50) + 1) * 50
+                    
+                    # Update skip threshold if this gives us a higher threshold
+                    current_threshold = skip_threshold_per_account_type.get(account_type_key)
+                    if current_threshold is None or next_multiple_of_50 > current_threshold:
+                        skip_threshold_per_account_type[account_type_key] = next_multiple_of_50
+                        print(f"    ℹ️  Skipping {addr_type} indices {index + 1} to {next_multiple_of_50 - 1} in account {account} (will check index {next_multiple_of_50})")
             elif status_code == 429:
                 print(f"    ❌ Rate limited - stopping to avoid further rate limits")
                 print(f"    💡 Wait a few minutes and run again, or reduce delay_between_requests")
@@ -286,6 +305,19 @@ def check_all_allocations(json_paths: List[str], output_file: str = "allocations
             night_allocation_night = night_allocation_star / 1_000_000
             
             print(f"    ✅ Registered: {crypto_receipts} receipts, {night_allocation_night:.6f} NIGHT ({night_allocation_star:,} STAR)")
+            
+            # If we found a registered address at a multiple of 50, clear the skip threshold
+            # This allows us to continue checking normally after reaching the threshold
+            # Only update skip threshold if skipping is enabled
+            if not no_skip and account is not None and addr_type:
+                account_type_key = (account, addr_type)
+                is_multiple_of_50 = (index % 50 == 0)
+                skip_threshold = skip_threshold_per_account_type.get(account_type_key)
+                if is_multiple_of_50 and skip_threshold is not None and index >= skip_threshold:
+                    # We've reached or passed the threshold and found a registered address
+                    # Clear the threshold to continue checking normally
+                    del skip_threshold_per_account_type[account_type_key]
+                    print(f"    ℹ️  Reached skip threshold at index {index}, continuing normal checks")
             
             total_star += night_allocation_star
             total_night += night_allocation_night
@@ -402,6 +434,9 @@ Examples:
   
   # Reduce delay between requests (faster but more likely to hit rate limits)
   python check_all_allocations.py --addresses addresses_enterprise.json --delay 0.5
+  
+  # Check all addresses without skipping (disable optimization)
+  python check_all_allocations.py --addresses addresses_enterprise.json --no-skip
         """
     )
     
@@ -427,6 +462,12 @@ Examples:
         help="Delay in seconds between API requests (default: 1.0, increase if rate limited)",
     )
     
+    parser.add_argument(
+        "--no-skip",
+        action="store_true",
+        help="Disable skipping optimization - check all addresses regardless of unregistered addresses found",
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -434,6 +475,7 @@ Examples:
             json_paths=args.addresses,
             output_file=args.output,
             delay_between_requests=args.delay,
+            no_skip=args.no_skip,
         )
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")

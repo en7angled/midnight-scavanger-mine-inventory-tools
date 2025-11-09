@@ -246,10 +246,22 @@ def register_addresses_from_json(
         # Use pycardano HDWallet derivation (matches Eternl wallet, correct addresses)
         try:
             if account is not None and index is not None:
+                # Determine if this is a staked or enterprise address based on type
+                is_staked = (addr_type == "staked")
+                
                 # Use pycardano HDWallet derivation (matches Eternl wallet, correct addresses)
-                _, signing_key, public_key_bytes = derive_address_from_mnemonic(
-                    mnemonic, account, index, network, use_cip1852
+                # Pass staked parameter to match the address type from JSON
+                derived_address, signing_key, public_key_bytes = derive_address_from_mnemonic(
+                    mnemonic, account, index, network, use_cip1852, staked=is_staked
                 )
+                
+                # Verify the derived address matches the JSON address
+                if derived_address != address:
+                    print(f"    ⚠️  Warning: Derived address doesn't match JSON address!")
+                    print(f"       JSON: {address}")
+                    print(f"       Derived: {derived_address}")
+                    print(f"       This might cause registration issues")
+                
                 # Keep the address from JSON (it's correct and matches Eternl)
                 # The public_key_bytes from derive_address_from_mnemonic matches the wallet's public key
                 display_name = f"account {account}, index {index} ({addr_type})"
@@ -265,19 +277,7 @@ def register_addresses_from_json(
         print(f"[{i}/{len(addresses_to_register)}] Registering: {display_name}")
         print(f"    Address: {address[:50]}...")
         
-        # Debug mode: Print request details for first address
-        if i == 1:
-            print(f"    🔍 Debug info for first request:")
-            print(f"       Address: {address}")
-            print(f"       Public key length: {len(public_key_bytes)} bytes")
-            print(f"       Public key hex: {public_key_bytes.hex()[:64]}...")
-            # Also print signature info
-            from consolidate_night import sign_message_cip30
-            if terms_message:
-                sig_hex = sign_message_cip30(terms_message, signing_key, address, use_cbor=True)
-                print(f"       Signature length: {len(sig_hex)} hex chars ({len(bytes.fromhex(sig_hex))} bytes)")
-                print(f"       Signature hex (first 100): {sig_hex[:100]}...")
-        
+
         try:
             # Use the public key that matches the address
             result = register_address(
@@ -310,12 +310,30 @@ def register_addresses_from_json(
                 result_entry["status"] = "already_registered"
             elif status_code == 400:
                 error_message = result.get("message", result.get("error", "Unknown error"))
+                
+                # Check if this address is already registered (not just the public key)
+                # "already registered" without "another wallet address" means THIS address is registered
+                # "already registered with another wallet address" means the public key is registered to a DIFFERENT address
                 if "already registered" in error_message.lower():
+                    if "another wallet address" in error_message.lower() or "different" in error_message.lower():
+                        # Public key registered to different address = this address is NOT registered
+                        print(f"    ❌ Error: Public key already registered to a different address")
+                        print(f"       This means this address is NOT registered")
+                        print(f"       Error: {error_message}")
+                        failed += 1
+                        result_entry["status"] = "failed"
+                        result_entry["error"] = error_message
+                    else:
+                        # This address is already registered
+                        print(f"    ℹ️  Already registered (400 Bad Request)")
+                        already_registered += 1
+                        result_entry["status"] = "already_registered"
+                elif "already exists" in error_message.lower():
                     print(f"    ℹ️  Already registered (400 Bad Request)")
                     already_registered += 1
                     result_entry["status"] = "already_registered"
                 else:
-                    # Other 400 errors
+                    # Other 400 errors - show the actual error message
                     print(f"    ❌ Error (Status {status_code}): {error_message}")
                     failed += 1
                     result_entry["status"] = "failed"

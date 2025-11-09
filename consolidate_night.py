@@ -22,7 +22,7 @@ from pycardano import (
 API_BASE_URL = "https://scavenger.prod.gd.midnighttge.io"
 
 
-def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, network: Network = Network.TESTNET, use_cip1852: bool = True) -> tuple[str, PaymentSigningKey, bytes]:
+def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, network: Network = Network.TESTNET, use_cip1852: bool = True, staked: bool = True) -> tuple[str, PaymentSigningKey, bytes]:
     """
     Derive a Cardano address from a mnemonic phrase.
     
@@ -36,27 +36,33 @@ def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, ne
         index: Address index within the account (default: 0)
         network: Cardano network (TESTNET or MAINNET)
         use_cip1852: If True, use CIP-1852 (default), if False, use BIP44
+        staked: If True, generate base address (addr1q) with stake, if False, generate enterprise address (addr1v) without stake
     
     Returns:
-        Tuple of (address_string, signing_key)
+        Tuple of (address_string, signing_key, public_key_bytes)
     """
     # Use pycardano's HDWallet which properly handles CIP-1852
     wallet = HDWallet.from_mnemonic(mnemonic)
     
     if use_cip1852:
         # CIP-1852 derivation path: m/1852'/1815'/account'/0/index (payment)
-        #                         m/1852'/1815'/account'/2/0 (stake)
         payment_path = f"m/1852'/1815'/{account}'/0/{index}"
-        stake_path = f"m/1852'/1815'/{account}'/2/0"
+        if staked:
+            # For staked addresses, we need stake path: m/1852'/1815'/account'/2/0
+            stake_path = f"m/1852'/1815'/{account}'/2/0"
     else:
         # BIP44 derivation path: m/44'/1815'/account'/0/index (payment)
-        # For BIP44, we still need stake for base address, use same account
         payment_path = f"m/44'/1815'/{account}'/0/{index}"
-        stake_path = f"m/44'/1815'/{account}'/2/0"
+        if staked:
+            # For staked addresses, we need stake path: m/44'/1815'/account'/2/0
+            stake_path = f"m/44'/1815'/{account}'/2/0"
     
-    # Derive payment and stake wallets
+    # Derive payment wallet
     payment_wallet = wallet.derive_from_path(payment_path, private=True)
-    stake_wallet = wallet.derive_from_path(stake_path, private=True)
+    
+    # Derive stake wallet only if needed for staked addresses
+    if staked:
+        stake_wallet = wallet.derive_from_path(stake_path, private=True)
     
     # Extract private key for signing
     # pycardano's HDWallet uses BIP32 Ed25519 where xprivate_key is kL + kR (64 bytes)
@@ -77,14 +83,21 @@ def derive_address_from_mnemonic(mnemonic: str, account: int, index: int = 0, ne
     # Create address hashes directly from public keys (Cardano uses blake2b-224)
     from hashlib import blake2b
     payment_hash = VerificationKeyHash(blake2b(payment_wallet.public_key, digest_size=28).digest())
-    stake_hash = VerificationKeyHash(blake2b(stake_wallet.public_key, digest_size=28).digest())
     
-    # Create base address with both payment and stake parts
-    address = Address(
-        payment_part=payment_hash,
-        staking_part=stake_hash,
-        network=network,
-    )
+    if staked:
+        stake_hash = VerificationKeyHash(blake2b(stake_wallet.public_key, digest_size=28).digest())
+        # Create base address with both payment and stake parts (addr1q)
+        address = Address(
+            payment_part=payment_hash,
+            staking_part=stake_hash,
+            network=network,
+        )
+    else:
+        # Create enterprise address without stake part (addr1v)
+        address = Address(
+            payment_part=payment_hash,
+            network=network,
+        )
     
     # Return address, signing key, and the public key bytes (32 bytes)
     # The wallet's public_key is what was used to create the address (matches Eternl)
@@ -113,10 +126,32 @@ def sign_message_cip30(message: str, signing_key: PaymentSigningKey, address: Op
     # Convert message to bytes (UTF-8 encoding)
     message_bytes = message.encode('utf-8')
     
-    # If not using CBOR, return raw hex signature (for donation endpoint)
-    if not use_cbor:
+    # Use BIP32ED25519PrivateKey for signing (same as registration)
+    # This ensures the signature can be verified with the wallet's public key
+    from pycardano.crypto.bip32 import BIP32ED25519PrivateKey
+    
+    # Check if we have the full xprivate_key and chain_code stored (from derive_address_from_mnemonic)
+    wallet_xprivate_key = getattr(signing_key, '_wallet_xprivate_key', None)
+    wallet_chain_code = getattr(signing_key, '_wallet_chain_code', None)
+    
+    if wallet_xprivate_key and wallet_chain_code and len(wallet_xprivate_key) == 64:
+        # Use BIP32ED25519PrivateKey for proper BIP32 Ed25519 signing
+        bip32_private_key = BIP32ED25519PrivateKey(
+            private_key=wallet_xprivate_key,  # kL + kR (64 bytes)
+            chain_code=wallet_chain_code
+        )
+        # Sign with BIP32 Ed25519 (returns 64-byte signature)
+        signature_bytes = bip32_private_key.sign(message_bytes)
+        
+        # If not using CBOR, return raw hex signature (for donation endpoint)
+        if not use_cbor:
+            return signature_bytes.hex()
+    else:
+        # Fallback to pycardano signing (might not work correctly)
+        # This should only happen if the signing key wasn't created via derive_address_from_mnemonic
         signature_bytes = signing_key.sign(message_bytes)
-        return signature_bytes.hex()
+        if not use_cbor:
+            return signature_bytes.hex()
     
     # For CBOR format (registration endpoint), we need the address
     import cbor2
@@ -196,16 +231,7 @@ def sign_message_cip30(message: str, signing_key: PaymentSigningKey, address: Op
     to_sign_cbor = cbor2.dumps(cose_sign_data)
     
     # Step 3: Sign the CoseSignData CBOR (not just the message!)
-    # We need to ensure the signature can be verified with the public key that matches the address
-    # The address was created with the wallet's public key, so we need to sign with a key
-    # that can be verified with that public key
-    from pycardano.crypto.bip32 import BIP32ED25519PrivateKey
-    
-    # Check if we have the full xprivate_key and chain_code stored (from derive_address_from_mnemonic)
-    # If so, use BIP32ED25519PrivateKey for proper BIP32 Ed25519 signing
-    wallet_xprivate_key = getattr(signing_key, '_wallet_xprivate_key', None)
-    wallet_chain_code = getattr(signing_key, '_wallet_chain_code', None)
-    
+    # Use BIP32ED25519PrivateKey for signing (same approach as donation)
     if wallet_xprivate_key and wallet_chain_code and len(wallet_xprivate_key) == 64:
         # Use BIP32ED25519PrivateKey for proper BIP32 Ed25519 signing
         # This ensures the signature can be verified with the wallet's public key
@@ -213,7 +239,7 @@ def sign_message_cip30(message: str, signing_key: PaymentSigningKey, address: Op
             private_key=wallet_xprivate_key,  # kL + kR (64 bytes)
             chain_code=wallet_chain_code
         )
-        # Sign with BIP32 Ed25519 (returns 64-byte signature)
+        # Sign the CoseSignData CBOR (not just the message!)
         signature_bytes = bip32_private_key.sign(to_sign_cbor)
     else:
         # Fallback to nacl signing (standard Ed25519, not BIP32)
