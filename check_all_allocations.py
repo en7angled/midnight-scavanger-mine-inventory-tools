@@ -12,7 +12,7 @@ import time
 import requests
 from datetime import datetime
 from typing import Dict, List, Optional
-from consolidate_night import load_addresses_from_json
+
 
 # Browser API base URL
 BROWSER_API_BASE_URL = "https://sm.midnight.gd/api"
