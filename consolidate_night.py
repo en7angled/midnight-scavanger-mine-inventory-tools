@@ -2,16 +2,19 @@
 """
 NIGHT Token Consolidation Script
 
-This script generates commands (curl) for consolidating NIGHT tokens from multiple 
-addresses into a single destination address using the Scavenger Mine API /donate_to endpoint.
+This script consolidates NIGHT tokens from multiple addresses into a single destination 
+address using the Scavenger Mine API /donate_to endpoint.
 
-IMPORTANT: This script ONLY generates commands - it NEVER executes them automatically.
-You must review and execute the generated commands manually to avoid mistakes.
+It processes addresses from an allocation report and generates a detailed consolidation report.
 """
 
 import argparse
 import json
 import urllib.parse
+import requests
+import time
+from datetime import datetime
+from collections import defaultdict
 from typing import Optional
 from pycardano import (
     Address,
@@ -399,7 +402,7 @@ def generate_consolidation_commands(
     output_file: str = "consolidation_commands.sh",
 ) -> None:
     """
-    Generate curl commands for consolidating from each source address to the destination.
+    Generate bash script with curl commands for consolidating NIGHT tokens.
     
     Only supports allocation report format (from check_all_allocations.py).
     Only generates commands for addresses with NIGHT allocations > 0.
@@ -410,7 +413,7 @@ def generate_consolidation_commands(
     Args:
         json_path: Path to allocation report JSON file (from check_all_allocations.py)
         mnemonic: BIP39 mnemonic phrase to derive signing keys
-        output_file: Path to output file for commands (default: consolidation_commands.sh)
+        output_file: Path to output bash script file (default: consolidation_commands.sh)
     """
     print(f"Loading allocation report from: {json_path}")
     
@@ -496,7 +499,6 @@ def generate_consolidation_commands(
             )
             # Get holdings information from allocation report
             night_allocation = addr_info.get("night_allocation_night", 0.0)
-            star_allocation = addr_info.get("night_allocation_star", 0)
             solutions = addr_info.get("crypto_receipts", 0)
             
             commands.append({
@@ -506,7 +508,6 @@ def generate_consolidation_commands(
                 "index": index,
                 "type": addr_type,
                 "night_allocation": night_allocation,
-                "star_allocation": star_allocation,
                 "solutions": solutions,
             })
             
@@ -559,27 +560,368 @@ def generate_consolidation_commands(
         traceback.print_exc()
 
 
+def consolidate_addresses(
+    json_path: str,
+    mnemonic: str,
+    report_file: str = "consolidation_report.json",
+    delay: float = 1.0,
+) -> None:
+    """
+    Consolidate NIGHT tokens from multiple addresses to the destination.
+    
+    Only supports allocation report format (from check_all_allocations.py).
+    Only consolidates addresses with NIGHT allocations > 0.
+    Generates a detailed report at the end.
+    
+    Args:
+        json_path: Path to allocation report JSON file (from check_all_allocations.py)
+        mnemonic: BIP39 mnemonic phrase to derive signing keys
+        report_file: Path to output report file (default: consolidation_report.json)
+        delay: Delay between requests in seconds (default: 1.0)
+    """
+    print(f"Loading allocation report from: {json_path}")
+    
+    # Load allocation report and derive keys
+    address_data, destination_address, destination_signing_key = load_allocation_report(
+        json_path, mnemonic
+    )
+    
+    # Allocation report format
+    metadata = address_data.get("metadata", {})
+    network_str = metadata.get("network", "MAINNET")
+    network = Network.MAINNET if network_str.lower() == "mainnet" else Network.TESTNET
+    use_cip1852 = True  # Default to CIP-1852
+    
+    # Get registered addresses with NIGHT allocations
+    registered_addresses = address_data.get("addresses", {}).get("registered", [])
+    
+    # Filter to only addresses with NIGHT allocations > 0
+    source_addresses = [
+        addr for addr in registered_addresses 
+        if addr.get("night_allocation_night", 0.0) > 0
+    ]
+    
+    # Calculate totals
+    total_night = sum(addr.get('night_allocation_night', 0.0) for addr in source_addresses)
+    total_star = sum(addr.get('night_allocation_star', 0) for addr in source_addresses)
+    total_solutions = sum(addr.get('crypto_receipts', 0) for addr in source_addresses)
+    
+    print(f"Network: {network_str}")
+    print(f"Destination address: {destination_address}")
+    print(f"Total registered addresses: {len(registered_addresses)}")
+    print(f"Addresses with NIGHT allocations: {len(source_addresses)}")
+    print(f"Total to consolidate:")
+    print(f"  - NIGHT: {total_night:,.6f} NIGHT")
+    print(f"  - STAR: {total_star:,} STAR")
+    print(f"  - Solutions: {total_solutions:,}")
+    print(f"\nStarting consolidation...\n")
+    
+    # Track consolidation results
+    consolidations = {
+        "successful": [],
+        "already_consolidated": [],
+        "failed": [],
+        "errors": [],
+    }
+    
+    # Track totals per destination
+    destination_totals = defaultdict(lambda: {"night": 0.0, "solutions": 0, "count": 0})
+    
+    for addr_info in source_addresses:
+        address = addr_info.get("address")
+        account = addr_info.get("account")
+        index = addr_info.get("index")
+        addr_type = addr_info.get("type", "unknown")
+        
+        if not address:
+            print(f"⚠️  Skipping entry with missing address: {addr_info}")
+            continue
+        
+        # Skip if same as destination
+        if address == destination_address:
+            print(f"⚠️  Skipping address (same as destination): {address[:50]}...")
+            continue
+        
+        # Derive signing key for this address
+        try:
+            if account is not None and index is not None:
+                # Determine if this is a staked or enterprise address based on type
+                is_staked = (addr_type == "staked")
+                
+                # Derive from account/index
+                _, signing_key, _ = derive_address_from_mnemonic(
+                    mnemonic, account, index, network, use_cip1852, staked=is_staked
+                )
+                display_name = f"account {account}, index {index} ({addr_type})"
+            else:
+                print(f"⚠️  Skipping {address[:50]}... (no account/index info)")
+                continue
+        except Exception as e:
+            print(f"⚠️  Could not derive key for {address[:50]}...: {e}")
+            continue
+        
+        # Get holdings information from allocation report
+        night_allocation = addr_info.get("night_allocation_night", 0.0)
+        star_allocation = addr_info.get("night_allocation_star", 0)
+        solutions = addr_info.get("crypto_receipts", 0)
+        
+        print(f"[{len(consolidations['successful']) + len(consolidations['already_consolidated']) + len(consolidations['failed']) + len(consolidations['errors']) + 1}/{len(source_addresses)}] {display_name}")
+        print(f"  Source: {address[:50]}...")
+        print(f"  Holdings: {night_allocation:,.6f} NIGHT, {solutions} solutions")
+        
+        # Generate consolidation command (URL with signature)
+        try:
+            api_url = generate_consolidation_command(
+                address,
+                destination_address,
+                signing_key,
+                destination_signing_key,
+            )
+            # Extract URL from curl command
+            import re
+            url_match = re.search(r"curl -X POST '([^']+)'", api_url)
+            if url_match:
+                api_url = url_match.group(1)
+            else:
+                print(f"  ❌ Error: Could not extract URL from command")
+                consolidations["errors"].append({
+                    "source": address,
+                    "destination": destination_address,
+                    "account": account,
+                    "index": index,
+                    "type": addr_type,
+                    "night": night_allocation,
+                    "solutions": solutions,
+                    "error": "Could not extract URL from command",
+                })
+                continue
+        except Exception as e:
+            print(f"  ❌ Error generating command: {e}")
+            consolidations["errors"].append({
+                "source": address,
+                "destination": destination_address,
+                "account": account,
+                "index": index,
+                "type": addr_type,
+                "night": night_allocation,
+                "solutions": solutions,
+                "error": str(e),
+            })
+            continue
+        
+        # Make the API request
+        try:
+            response = requests.post(api_url, timeout=30)
+            
+            # Parse response
+            try:
+                data = response.json()
+                status_code = response.status_code
+                message = data.get("message", "")
+                error = data.get("error", "")
+            except:
+                data = {}
+                status_code = response.status_code
+                message = response.text[:200]
+                error = f"HTTP {status_code}"
+            
+            if status_code == 200:
+                # Successfully consolidated
+                print(f"  ✅ Successfully consolidated!")
+                consolidations["successful"].append({
+                    "source": address,
+                    "destination": destination_address,
+                    "account": account,
+                    "index": index,
+                    "type": addr_type,
+                    "night": night_allocation,
+                    "solutions": solutions,
+                })
+                destination_totals[destination_address]["night"] += night_allocation
+                destination_totals[destination_address]["solutions"] += solutions
+                destination_totals[destination_address]["count"] += 1
+                
+            elif status_code == 409:
+                # Extract actual destination from message
+                # Format: "already has an active donation assignment to <address>"
+                import re
+                match = re.search(r'to (addr1[\w]+)', message)
+                if match:
+                    actual_dest = match.group(1)
+                    if actual_dest == destination_address:
+                        # Already consolidated to correct destination
+                        print(f"  ℹ️  Already consolidated to destination")
+                        consolidations["already_consolidated"].append({
+                            "source": address,
+                            "destination": destination_address,
+                            "account": account,
+                            "index": index,
+                            "type": addr_type,
+                            "night": night_allocation,
+                            "solutions": solutions,
+                        })
+                        destination_totals[destination_address]["night"] += night_allocation
+                        destination_totals[destination_address]["solutions"] += solutions
+                        destination_totals[destination_address]["count"] += 1
+                    else:
+                        # Already consolidated to different destination
+                        print(f"  ⚠️  Already consolidated to DIFFERENT destination: {actual_dest}")
+                        consolidations["failed"].append({
+                            "source": address,
+                            "intended_destination": destination_address,
+                            "actual_destination": actual_dest,
+                            "account": account,
+                            "index": index,
+                            "type": addr_type,
+                            "night": night_allocation,
+                            "solutions": solutions,
+                            "error": f"Already consolidated to different destination: {actual_dest}",
+                        })
+                else:
+                    # Could not extract destination from message
+                    print(f"  ⚠️  Conflict (409): {message}")
+                    consolidations["failed"].append({
+                        "source": address,
+                        "destination": destination_address,
+                        "account": account,
+                        "index": index,
+                        "type": addr_type,
+                        "night": night_allocation,
+                        "solutions": solutions,
+                        "error": message,
+                    })
+                    
+            elif status_code == 404:
+                print(f"  ⚠️  Address not registered or has no rewards (404)")
+                consolidations["failed"].append({
+                    "source": address,
+                    "destination": destination_address,
+                    "account": account,
+                    "index": index,
+                    "type": addr_type,
+                    "night": night_allocation,
+                    "solutions": solutions,
+                    "error": "Address not registered or has no rewards",
+                })
+            else:
+                print(f"  ❌ Error ({status_code}): {message or error}")
+                consolidations["failed"].append({
+                    "source": address,
+                    "destination": destination_address,
+                    "account": account,
+                    "index": index,
+                    "type": addr_type,
+                    "night": night_allocation,
+                    "solutions": solutions,
+                    "error": message or error,
+                    "status_code": status_code,
+                })
+                
+        except Exception as e:
+            print(f"  ❌ Exception: {e}")
+            consolidations["errors"].append({
+                "source": address,
+                "destination": destination_address,
+                "account": account,
+                "index": index,
+                "type": addr_type,
+                "night": night_allocation,
+                "solutions": solutions,
+                "error": str(e),
+            })
+        
+        print()
+        
+        # Delay between requests
+        if len(consolidations['successful']) + len(consolidations['already_consolidated']) + len(consolidations['failed']) + len(consolidations['errors']) < len(source_addresses):
+            time.sleep(delay)
+    
+    # Generate report
+    print("=" * 80)
+    print("CONSOLIDATION REPORT")
+    print("=" * 80)
+    print()
+    
+    # Summary
+    total_successful = len(consolidations["successful"])
+    total_already = len(consolidations["already_consolidated"])
+    total_failed = len(consolidations["failed"])
+    total_errors = len(consolidations["errors"])
+    
+    print("SUMMARY")
+    print("-" * 80)
+    print(f"Total addresses processed: {len(source_addresses)}")
+    print(f"✅ Successfully consolidated: {total_successful}")
+    print(f"ℹ️  Already consolidated: {total_already}")
+    print(f"❌ Failed: {total_failed}")
+    print(f"⚠️  Errors: {total_errors}")
+    print()
+    
+    # Totals by destination
+    print("TOTALS BY DESTINATION")
+    print("-" * 80)
+    for dest, totals in sorted(destination_totals.items()):
+        print(f"Destination: {dest}")
+        print(f"  Addresses: {totals['count']}")
+        print(f"  Total NIGHT: {totals['night']:,.6f} NIGHT")
+        print(f"  Total Solutions: {totals['solutions']:,}")
+        print()
+    
+    # Save detailed report to JSON
+    report = {
+        "metadata": {
+            "generated_at": datetime.now().isoformat(),
+            "source_file": json_path,
+            "destination_address": destination_address,
+            "total_addresses": len(source_addresses),
+        },
+        "summary": {
+            "successful": total_successful,
+            "already_consolidated": total_already,
+            "failed": total_failed,
+            "errors": total_errors,
+        },
+        "destination_totals": {k: dict(v) for k, v in destination_totals.items()},
+        "consolidations": consolidations,
+    }
+    
+    try:
+        with open(report_file, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print(f"✅ Detailed report saved to: {report_file}")
+        print("=" * 80)
+    except Exception as e:
+        print(f"\n❌ Error writing report file: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate consolidation commands for NIGHT tokens from multiple addresses into one",
+        description="Consolidate NIGHT tokens from multiple addresses into one destination",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-IMPORTANT: This script ONLY generates commands - it NEVER executes them automatically.
-You must review and execute the generated commands manually to avoid mistakes.
+This script consolidates NIGHT tokens from addresses in an allocation report to a destination address.
+It executes the consolidations and generates a detailed report at the end.
 
 Examples:
-  # Generate consolidation commands from allocation report (only addresses with NIGHT)
+  # Consolidate from allocation report (only addresses with NIGHT)
   python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 word2 ... word24"
   
-  # Specify custom output file for commands
-  python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --output my_commands.sh
+  # Specify custom report file and delay
+  python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --report my_report.json --delay 2.0
   
-  # After generating commands, review and execute:
-  # 1. Review the generated script: cat consolidation_commands.sh
-  # 2. Execute all commands: bash consolidation_commands.sh
-  # 3. Or execute commands one by one manually
+  # Generate bash script with commands instead of executing
+  python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --generate-commands
+  
+  # Generate commands with custom output file
+  python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --generate-commands --output my_commands.sh
+  
+  # Check the generated report
+  cat consolidation_report.json
         """
     )
     
@@ -598,10 +940,30 @@ Examples:
     )
     
     parser.add_argument(
+        "--report",
+        type=str,
+        default="consolidation_report.json",
+        help="Output file for consolidation report (default: consolidation_report.json)",
+    )
+    
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help="Delay between requests in seconds (default: 1.0)",
+    )
+    
+    parser.add_argument(
+        "--generate-commands",
+        action="store_true",
+        help="Generate bash script with commands instead of executing consolidations",
+    )
+    
+    parser.add_argument(
         "--output",
         type=str,
         default="consolidation_commands.sh",
-        help="Output file for generated commands (default: consolidation_commands.sh)",
+        help="Output file for generated bash script (default: consolidation_commands.sh, only used with --generate-commands)",
     )
     
     args = parser.parse_args()
@@ -614,13 +976,21 @@ Examples:
     
     mnemonic = " ".join(mnemonic_words)
     
-    # Generate consolidation commands (never execute)
+    # Execute consolidations or generate commands
     try:
-        generate_consolidation_commands(
-            json_path=args.addresses,
-            mnemonic=mnemonic,
-            output_file=args.output,
-        )
+        if args.generate_commands:
+            generate_consolidation_commands(
+                json_path=args.addresses,
+                mnemonic=mnemonic,
+                output_file=args.output,
+            )
+        else:
+            consolidate_addresses(
+                json_path=args.addresses,
+                mnemonic=mnemonic,
+                report_file=args.report,
+                delay=args.delay,
+            )
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
     except FileNotFoundError:
