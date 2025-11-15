@@ -342,13 +342,22 @@ def generate_consolidation_command(
     return curl_command
 
 
-def load_allocation_report(json_path: str, mnemonic: str) -> tuple[dict, str, PaymentSigningKey]:
+def load_allocation_report(
+    json_path: str, 
+    mnemonic: str,
+    destination_mnemonic: Optional[str] = None,
+    destination_account: Optional[int] = None,
+    destination_index: Optional[int] = None,
+) -> tuple[dict, str, PaymentSigningKey]:
     """
-    Load allocation report and derive destination signing key from mnemonic.
+    Load allocation report and derive destination signing key.
     
     Args:
         json_path: Path to allocation report JSON file (from check_all_allocations.py)
-        mnemonic: BIP39 mnemonic phrase to derive signing keys
+        mnemonic: BIP39 mnemonic phrase to derive source address signing keys
+        destination_mnemonic: Optional BIP39 mnemonic phrase for destination (if different from source)
+        destination_account: Optional account number to override destination from report
+        destination_index: Optional index to override destination from report
     
     Returns:
         Tuple of (address_data dict, destination_address, destination_signing_key)
@@ -368,30 +377,56 @@ def load_allocation_report(json_path: str, mnemonic: str) -> tuple[dict, str, Pa
     metadata = address_data.get("metadata", {})
     network_str = metadata.get("network", "MAINNET").lower()
     network = Network.MAINNET if network_str == "mainnet" else Network.TESTNET
-    
-    # Get destination from metadata.destinations (use first one)
-    destinations = metadata.get("destinations", [])
-    if not destinations:
-        raise ValueError("No destinations found in allocation report")
-    
-    dest_info = destinations[0]  # Use first destination
-    dest_account = dest_info.get("account", 0)
-    dest_index = dest_info.get("index", 0)
     use_cip1852 = True  # Default to CIP-1852
     
-    # Derive destination address and signing key
-    is_staked_dest = (dest_info.get("type", "staked") == "staked")
-    destination_address, destination_signing_key, _ = derive_address_from_mnemonic(
-        mnemonic, dest_account, dest_index, network, use_cip1852, staked=is_staked_dest
-    )
+    # Determine which mnemonic to use for destination
+    dest_mnemonic = destination_mnemonic if destination_mnemonic else mnemonic
     
-    # Verify destination address matches
-    expected_dest = dest_info.get("address")
-    if expected_dest and destination_address != expected_dest:
-        print(f"Warning: Derived destination address doesn't match report!")
-        print(f"  Expected: {expected_dest}")
-        print(f"  Derived:  {destination_address}")
-        print(f"  Using derived address...\n")
+    # Determine destination
+    if destination_account is not None and destination_index is not None:
+        # Use provided account/index to override report
+        dest_account = destination_account
+        dest_index = destination_index
+        
+        # Try to determine if staked from report, otherwise default to staked
+        destinations = metadata.get("destinations", [])
+        if destinations:
+            dest_info = destinations[0]
+            is_staked_dest = (dest_info.get("type", "staked") == "staked")
+        else:
+            is_staked_dest = True  # Default to staked
+        
+        # Derive destination address and signing key using destination mnemonic
+        destination_address, destination_signing_key, _ = derive_address_from_mnemonic(
+            dest_mnemonic, dest_account, dest_index, network, use_cip1852, staked=is_staked_dest
+        )
+        
+        print(f"Using destination from command-line arguments:")
+        print(f"  Account: {dest_account}, Index: {dest_index}")
+        print(f"  Address: {destination_address}\n")
+    else:
+        # Get destination from metadata.destinations (use first one)
+        destinations = metadata.get("destinations", [])
+        if not destinations:
+            raise ValueError("No destinations found in allocation report")
+        
+        dest_info = destinations[0]  # Use first destination
+        dest_account = dest_info.get("account", 0)
+        dest_index = dest_info.get("index", 0)
+        
+        # Derive destination address and signing key using destination mnemonic
+        is_staked_dest = (dest_info.get("type", "staked") == "staked")
+        destination_address, destination_signing_key, _ = derive_address_from_mnemonic(
+            dest_mnemonic, dest_account, dest_index, network, use_cip1852, staked=is_staked_dest
+        )
+        
+        # Verify destination address matches
+        expected_dest = dest_info.get("address")
+        if expected_dest and destination_address != expected_dest:
+            print(f"Warning: Derived destination address doesn't match report!")
+            print(f"  Expected: {expected_dest}")
+            print(f"  Derived:  {destination_address}")
+            print(f"  Using derived address...\n")
     
     return address_data, destination_address, destination_signing_key
 
@@ -400,6 +435,9 @@ def generate_consolidation_commands(
     json_path: str,
     mnemonic: str,
     output_file: str = "consolidation_commands.sh",
+    destination_mnemonic: Optional[str] = None,
+    destination_account: Optional[int] = None,
+    destination_index: Optional[int] = None,
 ) -> None:
     """
     Generate bash script with curl commands for consolidating NIGHT tokens.
@@ -412,14 +450,17 @@ def generate_consolidation_commands(
     
     Args:
         json_path: Path to allocation report JSON file (from check_all_allocations.py)
-        mnemonic: BIP39 mnemonic phrase to derive signing keys
+        mnemonic: BIP39 mnemonic phrase to derive source address signing keys
         output_file: Path to output bash script file (default: consolidation_commands.sh)
+        destination_mnemonic: Optional BIP39 mnemonic phrase for destination (if different from source)
+        destination_account: Optional account number to override destination from report
+        destination_index: Optional index to override destination from report
     """
     print(f"Loading allocation report from: {json_path}")
     
     # Load allocation report and derive keys
     address_data, destination_address, destination_signing_key = load_allocation_report(
-        json_path, mnemonic
+        json_path, mnemonic, destination_mnemonic, destination_account, destination_index
     )
     
     # Allocation report format
@@ -565,6 +606,9 @@ def consolidate_addresses(
     mnemonic: str,
     report_file: str = "consolidation_report.json",
     delay: float = 1.0,
+    destination_mnemonic: Optional[str] = None,
+    destination_account: Optional[int] = None,
+    destination_index: Optional[int] = None,
 ) -> None:
     """
     Consolidate NIGHT tokens from multiple addresses to the destination.
@@ -575,15 +619,18 @@ def consolidate_addresses(
     
     Args:
         json_path: Path to allocation report JSON file (from check_all_allocations.py)
-        mnemonic: BIP39 mnemonic phrase to derive signing keys
+        mnemonic: BIP39 mnemonic phrase to derive source address signing keys
         report_file: Path to output report file (default: consolidation_report.json)
         delay: Delay between requests in seconds (default: 1.0)
+        destination_mnemonic: Optional BIP39 mnemonic phrase for destination (if different from source)
+        destination_account: Optional account number to override destination from report
+        destination_index: Optional index to override destination from report
     """
     print(f"Loading allocation report from: {json_path}")
     
     # Load allocation report and derive keys
     address_data, destination_address, destination_signing_key = load_allocation_report(
-        json_path, mnemonic
+        json_path, mnemonic, destination_mnemonic, destination_account, destination_index
     )
     
     # Allocation report format
@@ -911,14 +958,20 @@ Examples:
   # Consolidate from allocation report (only addresses with NIGHT)
   python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 word2 ... word24"
   
+  # Override destination using account/index (same mnemonic)
+  python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --destination-account 1 --destination-index 1
+  
+  # Override destination using different mnemonic
+  python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --destination-mnemonic "dest word1 ... word24" --destination-account 1 --destination-index 1
+  
   # Specify custom report file and delay
   python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --report my_report.json --delay 2.0
   
   # Generate bash script with commands instead of executing
   python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --generate-commands
   
-  # Generate commands with custom output file
-  python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --generate-commands --output my_commands.sh
+  # Generate commands with custom output file and destination
+  python consolidate_night.py --addresses fri_allocations_report.json --mnemonic "word1 ... word24" --generate-commands --output my_commands.sh --destination-account 1 --destination-index 1
   
   # Check the generated report
   cat consolidation_report.json
@@ -966,6 +1019,24 @@ Examples:
         help="Output file for generated bash script (default: consolidation_commands.sh, only used with --generate-commands)",
     )
     
+    parser.add_argument(
+        "--destination-mnemonic",
+        type=str,
+        help="BIP39 mnemonic phrase for destination address (if different from source mnemonic)",
+    )
+    
+    parser.add_argument(
+        "--destination-account",
+        type=int,
+        help="Account number for destination address (overrides allocation report destination)",
+    )
+    
+    parser.add_argument(
+        "--destination-index",
+        type=int,
+        help="Index for destination address (overrides allocation report destination)",
+    )
+    
     args = parser.parse_args()
     
     # Validate mnemonic
@@ -976,6 +1047,20 @@ Examples:
     
     mnemonic = " ".join(mnemonic_words)
     
+    # Validate destination mnemonic if provided
+    destination_mnemonic = None
+    if args.destination_mnemonic:
+        dest_mnemonic_words = args.destination_mnemonic.strip().split()
+        if len(dest_mnemonic_words) not in [12, 15, 18, 21, 24]:
+            print("Error: Destination mnemonic must be 12, 15, 18, 21, or 24 words")
+            return
+        destination_mnemonic = " ".join(dest_mnemonic_words)
+    
+    # Validate destination account/index (both must be provided together)
+    if (args.destination_account is not None) != (args.destination_index is not None):
+        print("Error: --destination-account and --destination-index must be provided together")
+        return
+    
     # Execute consolidations or generate commands
     try:
         if args.generate_commands:
@@ -983,6 +1068,9 @@ Examples:
                 json_path=args.addresses,
                 mnemonic=mnemonic,
                 output_file=args.output,
+                destination_mnemonic=destination_mnemonic,
+                destination_account=args.destination_account,
+                destination_index=args.destination_index,
             )
         else:
             consolidate_addresses(
@@ -990,6 +1078,9 @@ Examples:
                 mnemonic=mnemonic,
                 report_file=args.report,
                 delay=args.delay,
+                destination_mnemonic=destination_mnemonic,
+                destination_account=args.destination_account,
+                destination_index=args.destination_index,
             )
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
